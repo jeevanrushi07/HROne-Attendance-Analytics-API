@@ -94,6 +94,12 @@ def compute_overtime(punch_out, shift_end, date_str, shift_start=None):
 def rounded(value, places=2):
     if value is None: return None
     return float(Decimal(str(value)).quantize(Decimal("1."+"0"*places), rounding=ROUND_HALF_UP))
+
+def same_value(left, right):
+    """Compare datetimes by instant, regardless of naive/aware UTC representation."""
+    if isinstance(left, datetime) and isinstance(right, datetime):
+        return epoch_ms(left) == epoch_ms(right)
+    return left == right
 def serial_employee(d):
     out={k:v for k,v in d.items() if k != "_id"}
     if "created_at" in out: out["created_at"]=epoch_ms(out["created_at"])
@@ -274,14 +280,14 @@ def regularize(emp_code:str,date:str,body:RegularizeIn):
     changes={}
     for k,v in new.items():
         old=original.get(k)
-        if old != v:
+        if not same_value(old, v):
             if k in ("punch_in","punch_out"):
                 changes[k]={"from":epoch_ms(old),"to":epoch_ms(v)}
             else:changes[k]={"from":old,"to":v}
     if not changes: raise HTTPException(422,"request does not change the record")
     entry={"at":now_utc(),"by":body.regularized_by,"reason":body.reason,"changes":changes}
     # Compare-and-swap protects concurrent updates and prevents lost audit entries.
-    update={k:new[k] for k in new if original.get(k)!=new[k]}
+    update={k:new[k] for k in new if not same_value(original.get(k), new[k])}
     cas_filter={"emp_code":emp_code,"date":date}
     if "history" in rec: cas_filter["history"]=rec["history"]
     else: cas_filter["history"]={"$exists":False}
@@ -319,10 +325,9 @@ def employee_monthly(emp_code:str,month:str=Query(...,pattern=r"^\d{4}-(0[1-9]|1
     pct=rounded(Decimal(str(present))*100/Decimal(working),4) if working else None
     return {"emp_code":emp_code,"month":month,"working_days":working,"present_days":rounded(present),"leave_days":int(stats.get("leave_days",0)),"late_count":int(stats.get("late_count",0)),"total_late_minutes":int(stats.get("total_late_minutes",0)),"total_overtime_minutes":int(stats.get("total_overtime_minutes",0)),"attendance_pct":pct}
 
-@app.get("/analytics/departments/summary")
-def department_summary(month:str=Query(...,pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),department:Optional[str]=None):
-    start,end=parse_month(month)
-    pipeline=[{"$match":{"joined_on":{"$lte":end.isoformat()},**({"department":department} if department is not None else {})}},
+def department_summary_pipeline(month, department=None):
+    start, end = parse_month(month)
+    return [{"$match":{"joined_on":{"$lte":end.isoformat()},**({"department":department} if department is not None else {})}},
       {"$lookup":{"from":"attendance_logs","let":{"code":"$emp_code"},"pipeline":[{"$match":{"$expr":{"$and":[{"$eq":["$emp_code","$$code"]},{"$gte":["$date",start.isoformat()]},{"$lte":["$date",end.isoformat()]}]}}}],"as":"logs"}},
       {"$unwind":{"path":"$logs","preserveNullAndEmptyArrays":True}},
       {"$set":{"_d":{"$dateFromString":{"dateString":{"$ifNull":["$logs.date",start.isoformat()]},"timezone":"Asia/Kolkata"}},"_status":"$logs.status","_half":{"$ifNull":["$logs.half_day",False]},"_wh":"$logs.work_hours","_late":{"$ifNull":["$logs.late_minutes",0]},"_ot":{"$ifNull":["$logs.overtime_minutes",0]}}},
@@ -335,32 +340,30 @@ def department_summary(month:str=Query(...,pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),d
       {"$group":{"_id":"$_id.department","headcount":{"$sum":"$headcount"},"present_days":{"$sum":"$present_days"},"work_sum":{"$sum":"$work_sum"},"work_count":{"$sum":"$work_count"},"late_count":{"$sum":"$late_count"},"total_late_minutes":{"$sum":"$total_late_minutes"},"leave_count":{"$sum":"$leave_count"},"on_duty_count":{"$sum":"$on_duty_count"}}},
       {"$match":{"headcount":{"$gt":0}}},{"$sort":{"_id":1}},
       {"$project":{"_id":0,"department":"$_id","headcount":1,"present_days":{"$round":["$present_days",2]},"avg_work_hours":{"$cond":[{"$gt":["$work_count",0]},{"$divide":[{"$floor":{"$add":[{"$multiply":[{"$divide":["$work_sum","$work_count"]},100]},0.5]}},100]},None]},"late_count":1,"total_late_minutes":1,"leave_count":1,"on_duty_count":1}}]
-    items=list(db.employees.aggregate(pipeline))
+
+@app.get("/analytics/departments/summary")
+def department_summary(month:str=Query(...,pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),department:Optional[str]=None):
+    items=list(db.employees.aggregate(department_summary_pipeline(month, department)))
     return {"month":month,"items":items}
 
-@app.get("/analytics/leaderboard/late")
-def late_leaderboard(month:str=Query(...,pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),limit:int=Query(10,ge=1,le=50),department:Optional[str]=None):
-    start,end=parse_month(month)
+def late_leaderboard_pipeline(month, limit=10, department=None):
+    start, end = parse_month(month)
     pipeline=[{"$match":{"date":{"$gte":start.isoformat(),"$lte":end.isoformat()},"late_minutes":{"$gt":0}}},
       {"$group":{"_id":"$emp_code","total_late_minutes":{"$sum":"$late_minutes"},"late_count":{"$sum":1}}},
       {"$lookup":{"from":"employees","localField":"_id","foreignField":"emp_code","as":"employee"}}, {"$unwind":"$employee"}]
-    if department is not None: pipeline.append({"$match":{"employee.department":department}})
+    if department is not None:
+        pipeline.append({"$match":{"employee.department":department}})
     pipeline += [{"$setWindowFields":{"sortBy":{"total_late_minutes":-1},"output":{"rank":{"$rank":{}}}}},
       {"$match":{"rank":{"$lte":limit}}},{"$sort":{"total_late_minutes":-1,"_id":1}},
       {"$project":{"_id":0,"rank":1,"emp_code":"$_id","name":"$employee.name","department":"$employee.department","total_late_minutes":1,"late_count":1}}]
-    return {"month":month,"items":list(db.attendance_logs.aggregate(pipeline))}
+    return pipeline
 
-@app.get("/analytics/departments/{department}/trend")
-def department_trend(department: str, from_date: str = Query(..., alias="from"), to_date: str = Query(..., alias="to")):
-    first, last = iso_date(from_date), iso_date(to_date)
-    if last < first:
-        raise HTTPException(422, "to must be on or after from")
-    if (last - first).days + 1 > 92:
-        raise HTTPException(422, "date range must not exceed 92 days")
-    if not db.employees.find_one({"department": department}):
-        raise HTTPException(404, "department not found")
-    # The daily calendar is generated in MongoDB; no Python date loop is used for the trend.
-    pipeline = [
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(month:str=Query(...,pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),limit:int=Query(10,ge=1,le=50),department:Optional[str]=None):
+    return {"month":month,"items":list(db.attendance_logs.aggregate(late_leaderboard_pipeline(month, limit, department)))}
+
+def department_trend_pipeline(department, from_date, to_date):
+    return [
         {"$documents": [{"start": from_date, "end": to_date, "department": department}]},
         {"$set": {"days": {"$range": [0, {"$add": [{"$dateDiff": {
             "startDate": {"$dateFromString": {"dateString": "$start", "timezone": "Asia/Kolkata"}},
@@ -393,8 +396,18 @@ def department_trend(department: str, from_date: str = Query(..., alias="from"),
                        "present_count": {"$round": ["$present_count", 2]}, "late_count": 1,
                        "attendance_rate": 1, "moving_avg_7d": {"$divide": [{"$floor": {"$add": [{"$multiply": ["$moving_avg_7d", 10000]}, 0.5]}}, 10000]}}}
     ]
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(department: str, from_date: str = Query(..., alias="from"), to_date: str = Query(..., alias="to")):
+    first, last = iso_date(from_date), iso_date(to_date)
+    if last < first:
+        raise HTTPException(422, "to must be on or after from")
+    if (last - first).days + 1 > 92:
+        raise HTTPException(422, "date range must not exceed 92 days")
+    if not db.employees.find_one({"department": department}):
+        raise HTTPException(404, "department not found")
     try:
-        items = list(db.command({"aggregate": 1, "pipeline": pipeline, "cursor": {}})["cursor"]["firstBatch"])
+        items = list(db.command({"aggregate": 1, "pipeline": department_trend_pipeline(department, from_date, to_date), "cursor": {}})["cursor"]["firstBatch"])
     except HTTPException:
         raise
     except Exception as exc:
@@ -411,9 +424,15 @@ def explain(endpoint:str,emp_code:Optional[str]=None,month:Optional[str]=None,de
     allowed={"attendance_list","employee_monthly","department_summary","late_leaderboard","department_trend"}
     if endpoint not in allowed: raise HTTPException(422,"unsupported endpoint")
     if endpoint=="attendance_list":
+        if date_from: iso_date(date_from)
+        if date_to: iso_date(date_to)
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(422, "date_from must be <= date_to")
+        if status is not None and status not in STATUSES:
+            raise HTTPException(422, "invalid status")
         q={}
-        if emp_code:q["emp_code"]=emp_code
-        if status:q["status"]=status
+        if emp_code is not None:q["emp_code"]=emp_code
+        if status is not None:q["status"]=status
         if date_from or date_to:
             q["date"]={}
             if date_from:q["date"]["$gte"]=date_from
@@ -427,16 +446,17 @@ def explain(endpoint:str,emp_code:Optional[str]=None,month:Optional[str]=None,de
             if not emp_code: raise HTTPException(422,"emp_code is required")
             op={"aggregate":"attendance_logs","pipeline":monthly_pipeline(emp_code,month),"cursor":{}};collection="attendance_logs"
         elif endpoint=="department_summary":
-            start,end=parse_month(month); filt={"joined_on":{"$lte":end.isoformat()}}
-            if department is not None:filt["department"]=department
-            op={"aggregate":"employees","pipeline":[{"$match":filt},{"$lookup":{"from":"attendance_logs","localField":"emp_code","foreignField":"emp_code","as":"logs"}}],"cursor":{}};collection="employees"
+            op={"aggregate":"employees","pipeline":department_summary_pipeline(month, department),"cursor":{}};collection="employees"
         elif endpoint=="late_leaderboard":
-            start,end=parse_month(month); q={"date":{"$gte":start.isoformat(),"$lte":end.isoformat()},"late_minutes":{"$gt":0}}
-            op={"aggregate":"attendance_logs","pipeline":[{"$match":q},{"$group":{"_id":"$emp_code","total_late_minutes":{"$sum":"$late_minutes"}}}],"cursor":{}};collection="attendance_logs"
+            op={"aggregate":"attendance_logs","pipeline":late_leaderboard_pipeline(month, limit, department),"cursor":{}};collection="attendance_logs"
         else:
             if not department or not from_date or not to_date: raise HTTPException(422,"department, from and to are required")
-            iso_date(from_date);iso_date(to_date)
-            op={"aggregate":1,"pipeline":[{"$documents":[{"department":department,"start":from_date,"end":to_date}]},{"$lookup":{"from":"attendance_logs","pipeline":[{"$match":{"date":{"$gte":from_date,"$lte":to_date}}}],"as":"logs"}}],"cursor":{}};collection="employees"
+            first, last = iso_date(from_date), iso_date(to_date)
+            if last < first: raise HTTPException(422, "to must be on or after from")
+            if (last-first).days+1 > 92: raise HTTPException(422, "date range must not exceed 92 days")
+            if not db.employees.find_one({"department":department}):
+                raise HTTPException(404, "department not found")
+            op={"aggregate":1,"pipeline":department_trend_pipeline(department, from_date, to_date),"cursor":{}};collection="attendance_logs"
     try:
         explain_doc=db.command({"explain":op,"verbosity":"executionStats"})
         return {"endpoint":endpoint,"collection":collection,"explain":json_safe(explain_doc)}
